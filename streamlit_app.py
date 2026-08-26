@@ -234,9 +234,14 @@ def score_property(row, budget):
     cancellation = 95 if row["refundable"] else 50
     bedroom = row["bedroom_score"]
 
+    # Bedroom weighting is only active when it is a user preference.
+    # The caller sets row["bedroom_weight"] based on the selected option.
+    bedroom_weight = row.get("bedroom_weight", 0.15)
+    other_weight = .15 - bedroom_weight
+
     return round(
-        .30*price + .20*quality + .15*location + .15*bedroom
-        + .10*cancellation + .05*amenities + .05*loyalty, 1
+        .30*price + .20*quality + .15*location + bedroom_weight*bedroom
+        + other_weight*75 + .10*cancellation + .05*amenities + .05*loyalty, 1
     )
 
 def amenity_hits(facilities):
@@ -256,7 +261,7 @@ def amenity_hits(facilities):
 
 # ---------------- UI ----------------
 st.title("✈️ Travel Optimizer")
-st.caption("Phase 2.5 — live rates + property enrichment + family-fit filtering")
+st.caption("Phase 2.7 — live rates + property enrichment + configurable preferences")
 
 with st.sidebar:
     st.header("Trip")
@@ -271,9 +276,21 @@ with st.sidebar:
     hotels_to_search = st.slider("Hotels to search", 5, 100, 30)
 
     st.divider()
-    st.header("Hard requirement")
-    st.write("**1+ private bedroom**")
-    st.caption("Standard hotel rooms are filtered out of the ranked shortlist.")
+    st.header("Room configuration")
+    bedroom_preference = st.selectbox(
+        "Separate bedroom",
+        ["Required", "Preferred", "No preference"],
+        index=0,
+        help=(
+            "Required = exclude results without evidence of a private bedroom. "
+            "Preferred = keep everything, but favor properties with bedroom evidence. "
+            "No preference = do not use bedroom configuration in the ranking."
+        ),
+    )
+    st.caption(
+        "For this Stowe test, leave it on **Required**. "
+        "For future trips, you can change it without rebuilding the search."
+    )
 
     st.divider()
     st.header("Live data connection")
@@ -324,16 +341,25 @@ if run:
             excluded = 0
 
             for hid, rates in grouped.items():
-                compatible = [r for r in rates if r["bedroom_score"] > 0]
-                if not compatible:
-                    excluded += 1
-                    continue
+                # Required: only return properties with some bedroom evidence.
+                # Preferred: keep all properties, but choose/rank the strongest
+                # configuration first.
+                # No preference: choose the cheapest rate at each property.
+                if bedroom_preference == "Required":
+                    eligible = [r for r in rates if r["bedroom_score"] > 0]
+                    if not eligible:
+                        excluded += 1
+                        continue
+                else:
+                    eligible = rates
 
-                # Prefer the strongest bedroom evidence, then price.
-                best = sorted(
-                    compatible,
-                    key=lambda x: (-x["bedroom_score"], x["total"])
-                )[0]
+                if bedroom_preference == "No preference":
+                    best = min(eligible, key=lambda x: x["total"])
+                else:
+                    best = sorted(
+                        eligible,
+                        key=lambda x: (-x["bedroom_score"], x["total"])
+                    )[0]
 
                 # Current rates responses can already contain brief hotel data.
                 rate_hotel = {}
@@ -389,6 +415,9 @@ if run:
                 best["image"] = detail.get("image") or rate_hotel.get("main_photo")
                 best["description"] = detail.get("description", "")
                 best["amenity_hits"] = amenity_hits(best["facilities"])
+                best["bedroom_weight"] = (
+                    0.15 if bedroom_preference in ("Required", "Preferred") else 0.0
+                )
                 best["score"] = score_property(best, budget)
                 properties.append(best)
 
@@ -415,10 +444,19 @@ if properties:
         f"Found {len(properties)} candidate properties from {raw_count} live room-rate options."
     )
 
-    if excluded:
+    if bedroom_preference == "Required" and excluded:
         st.info(
             f"Filtered out {excluded} properties because none of their returned rooms "
             "showed evidence of a private bedroom."
+        )
+    elif bedroom_preference == "Preferred":
+        st.info(
+            "Bedroom configuration is being used as a ranking preference, "
+            "but properties without bedroom evidence are still included."
+        )
+    elif bedroom_preference == "No preference":
+        st.info(
+            "Bedroom configuration is not being used as a filter or ranking factor."
         )
 
     st.subheader("🏆 Ranked shortlist")
@@ -463,10 +501,10 @@ if properties:
     st.subheader("What we're doing now")
     st.write(
         "The optimizer now groups room rates by property, enriches each property with Nuitee's "
-        "hotel-content data, filters obvious standard-room results, and ranks the best family-compatible "
-        "option from each property. Nuitee documents the hotel-content endpoint as providing names, "
-        "addresses, ratings, amenities, images and descriptions. The next major layer is rewards/platform "
-        "comparison."
+        "hotel-content data, and applies the user's selected room-configuration preference. "
+        "Required filters out results without bedroom evidence; Preferred keeps them but favors "
+        "better bedroom configurations; No preference ignores bedroom configuration. "
+        "The next major layer is rewards/platform comparison."
     )
 
 else:
