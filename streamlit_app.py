@@ -163,7 +163,12 @@ def parse_hotel_detail(raw):
         ]
         address_text = ", ".join(str(x) for x in parts if x)
 
-    facilities = data.get("facilities") or data.get("amenities") or []
+    facilities = (
+        data.get("hotelFacilities")
+        or data.get("facilities")
+        or data.get("amenities")
+        or []
+    )
     facility_names = []
     for f in facilities:
         if isinstance(f, str):
@@ -179,16 +184,23 @@ def parse_hotel_detail(raw):
         img = images[0]
         image_url = img if isinstance(img, str) else first(img, "url", "imageUrl", "href")
 
-    rating = first(data, "rating", "starRating", "stars")
+    review_rating = first(data, "rating")
     try:
-        rating = float(rating)
+        review_rating = float(review_rating)
     except (TypeError, ValueError):
-        rating = None
+        review_rating = None
+
+    star_rating = first(data, "starRating", "stars")
+    try:
+        star_rating = float(star_rating)
+    except (TypeError, ValueError):
+        star_rating = None
 
     return {
         "name": name,
         "address": address_text,
-        "rating": rating,
+        "review_rating": review_rating,
+        "star_rating": star_rating,
         "facilities": facility_names,
         "image": image_url,
         "description": first(data, "description", "shortDescription", default=""),
@@ -207,8 +219,12 @@ def price_score(total, budget):
 
 def score_property(row, budget):
     price = price_score(row["total"], budget)
-    rating = row.get("rating") or 3.75
-    quality = min(100, max(0, rating * 20))
+    review_rating = row.get("review_rating")
+    if review_rating is None:
+        quality = 75
+    else:
+        # Nuitee review ratings are on a 0-10 scale.
+        quality = min(100, max(0, float(review_rating) * 10))
 
     # Location/amenities/loyalty are intentionally conservative until
     # we add destination-aware and loyalty-specific sources.
@@ -319,6 +335,24 @@ if run:
                     key=lambda x: (-x["bedroom_score"], x["total"])
                 )[0]
 
+                # Current rates responses can already contain brief hotel data.
+                rate_hotel = {}
+                for candidate in (
+                    raw.get("hotels", []) if isinstance(raw, dict) else [],
+                    [x.get("hotelData", {}) for x in (raw.get("data", []) if isinstance(raw, dict) else [])],
+                ):
+                    if not isinstance(candidate, list):
+                        continue
+                    for item in candidate:
+                        if not isinstance(item, dict):
+                            continue
+                        candidate_id = item.get("id") or item.get("hotelId")
+                        if candidate_id == hid:
+                            rate_hotel = item
+                            break
+                    if rate_hotel:
+                        break
+
                 try:
                     detail_raw = api_get(
                         "/data/hotel",
@@ -330,11 +364,29 @@ if run:
                     detail = {}
 
                 best["hotel_id"] = hid
-                best["name"] = detail.get("name") or f"Hotel {hid}"
-                best["address"] = detail.get("address", "")
-                best["rating"] = detail.get("rating")
+                best["name"] = (
+                    detail.get("name")
+                    or rate_hotel.get("name")
+                    or best.get("name")
+                    or f"Hotel {hid}"
+                )
+                best["address"] = (
+                    detail.get("address")
+                    or rate_hotel.get("address")
+                    or best.get("address", "")
+                )
+                best["review_rating"] = (
+                    detail.get("review_rating")
+                    if detail.get("review_rating") is not None
+                    else rate_hotel.get("rating")
+                )
+                best["star_rating"] = (
+                    detail.get("star_rating")
+                    if detail.get("star_rating") is not None
+                    else rate_hotel.get("starRating")
+                )
                 best["facilities"] = detail.get("facilities", [])
-                best["image"] = detail.get("image")
+                best["image"] = detail.get("image") or rate_hotel.get("main_photo")
                 best["description"] = detail.get("description", "")
                 best["amenity_hits"] = amenity_hits(best["facilities"])
                 best["score"] = score_property(best, budget)
@@ -392,8 +444,11 @@ if properties:
             with c2:
                 st.metric("7-night total", f"${p['total']:,.0f}")
                 st.write(f"Optimizer score: **{p['score']}/100**")
-                if p["rating"]:
-                    st.write(f"Hotel rating: **{p['rating']:.1f}/5**")
+                if p.get("review_rating") is not None:
+                    st.write(f"Guest rating: **{p['review_rating']:.1f}/10**")
+                if p.get("star_rating") is not None:
+                    stars = p["star_rating"]
+                    st.write(f"Hotel class: **{stars:g}/5 stars**")
 
             with c3:
                 st.write(
