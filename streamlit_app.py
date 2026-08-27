@@ -6,49 +6,31 @@ from datetime import date
 from uuid import uuid4
 
 st.set_page_config(page_title="Travel Optimizer", page_icon="✈️", layout="wide")
-
 API_BASE = "https://api.liteapi.travel/v3.0"
 
-# ---------------- API ----------------
 def api_get(path, key, params=None):
-    r = requests.get(
-        API_BASE + path,
-        params=params or {},
-        headers={"X-API-Key": key, "Accept": "application/json"},
-        timeout=20,
-    )
+    r = requests.get(API_BASE + path, params=params or {},
+                     headers={"X-API-Key": key, "Accept": "application/json"}, timeout=20)
     if r.status_code == 401:
-        raise RuntimeError("Nuitee rejected the API key (401). Use the sandbox key that starts with sand_.")
+        raise RuntimeError("Nuitee rejected the API key (401). Use the sandbox key beginning with sand_.")
     if not r.ok:
-        try:
-            detail = r.json()
-        except Exception:
-            detail = r.text
+        try: detail = r.json()
+        except Exception: detail = r.text
         raise RuntimeError(f"Nuitee returned HTTP {r.status_code}: {detail}")
     return r.json()
 
 def api_post(path, payload, key):
-    r = requests.post(
-        API_BASE + path,
-        json=payload,
-        headers={
-            "X-API-Key": key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        timeout=35,
-    )
+    r = requests.post(API_BASE + path, json=payload,
+                      headers={"X-API-Key": key, "Content-Type": "application/json",
+                               "Accept": "application/json"}, timeout=35)
     if r.status_code == 401:
-        raise RuntimeError("Nuitee rejected the API key (401). Use the sandbox key that starts with sand_.")
+        raise RuntimeError("Nuitee rejected the API key (401). Use the sandbox key beginning with sand_.")
     if not r.ok:
-        try:
-            detail = r.json()
-        except Exception:
-            detail = r.text
+        try: detail = r.json()
+        except Exception: detail = r.text
         raise RuntimeError(f"Nuitee returned HTTP {r.status_code}: {detail}")
     return r.json()
 
-# ---------------- parsing helpers ----------------
 def first(d, *keys, default=None):
     for k in keys:
         if isinstance(d, dict) and d.get(k) not in (None, ""):
@@ -59,15 +41,11 @@ def extract_total(rate):
     retail = rate.get("retailRate") or {}
     totals = retail.get("total") or []
     if totals and isinstance(totals[0], dict):
-        try:
-            return float(totals[0].get("amount")), totals[0].get("currency", "USD")
-        except (TypeError, ValueError):
-            pass
+        try: return float(totals[0].get("amount")), totals[0].get("currency", "USD")
+        except (TypeError, ValueError): pass
     for k in ("total", "amount"):
-        try:
-            return float(rate[k]), "USD"
-        except (KeyError, TypeError, ValueError):
-            pass
+        try: return float(rate[k]), "USD"
+        except (KeyError, TypeError, ValueError): pass
     return None, "USD"
 
 def cancellation(rate):
@@ -75,33 +53,20 @@ def cancellation(rate):
     tag = str(cp.get("refundableTag") or "").upper()
     refundable = tag == "RFN"
     details = cp.get("cancelPolicyInfos") or cp.get("policies") or []
-    if isinstance(details, dict):
-        details = [details]
+    if isinstance(details, dict): details = [details]
     return refundable, details
 
 def room_class(room_name, rate):
-    text = " ".join([
-        str(room_name or ""),
-        str(rate.get("roomName") or ""),
-        str(rate.get("name") or ""),
-    ]).lower()
-
-    # Strong evidence for a true private-bedroom configuration.
-    if re.search(r"\b([2-9]|10)\s*[- ]?bedroom\b", text):
-        return "2+ BR", 100
-    if re.search(r"\b(one|1)\s*[- ]?bedroom\b", text):
-        return "1 BR", 100
-
-    # Common suite language: useful but not proof of a private bedroom.
-    if "suite" in text or "apartment" in text or "villa" in text or "residence" in text:
+    text = " ".join([str(room_name or ""), str(rate.get("roomName") or ""),
+                     str(rate.get("name") or "")]).lower()
+    if re.search(r"\b([2-9]|10)\s*[- ]?bedroom\b", text): return "2+ BR", 100
+    if re.search(r"\b(one|1)\s*[- ]?bedroom\b", text): return "1 BR", 100
+    if any(x in text for x in ("suite", "apartment", "villa", "residence")):
         return "Suite / residence — verify bedroom", 70
-
-    # Clearly not what the user wants.
     if re.search(r"\b(two|2)\s+(double|queen|full)\b", text) or "double bed" in text or "twin bed" in text:
         return "Standard room — no separate bedroom evidence", 0
     if re.search(r"\bking\b|\bqueen\b|\bdouble\b|\btwin\b", text):
         return "Standard room — no separate bedroom evidence", 0
-
     return "Configuration unclear — verify bedroom", 30
 
 def flatten_rates(raw):
@@ -110,402 +75,246 @@ def flatten_rates(raw):
         hid = hotel.get("hotelId") or hotel.get("id")
         hotel_data = hotel.get("hotelData") or {}
         room_types = hotel.get("roomTypes") or []
-
-        if not room_types and hotel.get("rates"):
-            room_types = [{"rates": hotel.get("rates")}]
-
+        if not room_types and hotel.get("rates"): room_types = [{"rates": hotel.get("rates")}]
         for rt in room_types:
             for rate in rt.get("rates") or []:
                 total, currency = extract_total(rate)
-                if total is None:
-                    continue
-
-                room_name = first(
-                    rate, "name", "roomName",
-                    default=first(rt, "name", "roomName", default="Room type not supplied")
-                )
-                refundable, cancel_details = cancellation(rate)
-                room_label, bedroom_score = room_class(room_name, rate)
-
+                if total is None: continue
+                room_name = first(rate, "name", "roomName",
+                                  default=first(rt, "name", "roomName", default="Room type not supplied"))
+                refundable, details = cancellation(rate)
+                label, bedroom_score = room_class(room_name, rate)
                 rows.append({
-                    "hotel_id": hid,
-                    "room": room_name,
-                    "room_label": room_label,
-                    "bedroom_score": bedroom_score,
-                    "total": total,
-                    "currency": currency,
-                    "refundable": refundable,
-                    "cancel_details": cancel_details,
+                    "hotel_id": hid, "room": room_name, "room_label": label,
+                    "bedroom_score": bedroom_score, "total": total, "currency": currency,
+                    "refundable": refundable, "cancel_details": details,
                     "board": first(rate, "boardName", "board", default=""),
-                    "mapped_room_id": first(rate, "mappedRoomId", "mappedRoomID"),
-                    "raw_rate": rate,
+                    "rate_hotel_data": hotel_data
                 })
     return rows
 
 def parse_hotel_detail(raw):
     data = raw.get("data") or raw
-    if isinstance(data, list):
-        data = data[0] if data else {}
-    if not isinstance(data, dict):
-        return {}
-
-    # Nuitee's content API can vary slightly by response shape.
-    name = first(data, "name", "hotelName", default="")
+    if isinstance(data, list): data = data[0] if data else {}
+    if not isinstance(data, dict): return {}
     address = data.get("address") or {}
-    if isinstance(address, str):
-        address_text = address
+    if isinstance(address, str): address_text = address
     else:
-        parts = [
-            address.get("line1") or address.get("addressLine1"),
-            address.get("city"),
-            address.get("state"),
-            address.get("postalCode") or address.get("zipCode"),
-        ]
+        parts = [address.get("line1") or address.get("addressLine1"), address.get("city"),
+                 address.get("state"), address.get("postalCode") or address.get("zipCode")]
         address_text = ", ".join(str(x) for x in parts if x)
-
-    facilities = (
-        data.get("hotelFacilities")
-        or data.get("facilities")
-        or data.get("amenities")
-        or []
-    )
-    facility_names = []
+    facilities = data.get("hotelFacilities") or data.get("facilities") or data.get("amenities") or []
+    names = []
     for f in facilities:
-        if isinstance(f, str):
-            facility_names.append(f)
+        if isinstance(f, str): names.append(f)
         elif isinstance(f, dict):
             v = first(f, "name", "facilityName", "description")
-            if v:
-                facility_names.append(str(v))
-
-    images = data.get("images") or data.get("photos") or []
-    image_url = None
-    if images:
-        img = images[0]
-        image_url = img if isinstance(img, str) else first(img, "url", "imageUrl", "href")
-
-    review_rating = first(data, "rating")
-    try:
-        review_rating = float(review_rating)
-    except (TypeError, ValueError):
-        review_rating = None
-
-    star_rating = first(data, "starRating", "stars")
-    try:
-        star_rating = float(star_rating)
-    except (TypeError, ValueError):
-        star_rating = None
-
-    return {
-        "name": name,
-        "address": address_text,
-        "review_rating": review_rating,
-        "star_rating": star_rating,
-        "facilities": facility_names,
-        "image": image_url,
-        "description": first(data, "description", "shortDescription", default=""),
-        "lat": first(data, "latitude", "lat"),
-        "lon": first(data, "longitude", "lng", "lon"),
-        "raw": data,
-    }
-
-# ---------------- scoring ----------------
-def price_score(total, budget):
-    if total <= budget:
-        return 70 + 30 * (budget-total) / budget
-    if total <= budget * 1.20:
-        return 70 - 40 * (total-budget) / (budget*.20)
-    return max(0, 30 - 60 * (total-budget*1.20) / budget)
-
-def score_property(row, budget):
-    price = price_score(row["total"], budget)
-    review_rating = row.get("review_rating")
-    if review_rating is None:
-        quality = 75
-    else:
-        # Nuitee review ratings are on a 0-10 scale.
-        quality = min(100, max(0, float(review_rating) * 10))
-
-    # Location/amenities/loyalty are intentionally conservative until
-    # we add destination-aware and loyalty-specific sources.
-    location = 75
-    amenities = 60
-    loyalty = 55
-    cancellation = 95 if row["refundable"] else 50
-    bedroom = row["bedroom_score"]
-
-    # Bedroom weighting is only active when it is a user preference.
-    # The caller sets row["bedroom_weight"] based on the selected option.
-    bedroom_weight = row.get("bedroom_weight", 0.15)
-    other_weight = .15 - bedroom_weight
-
-    return round(
-        .30*price + .20*quality + .15*location + bedroom_weight*bedroom
-        + other_weight*75 + .10*cancellation + .05*amenities + .05*loyalty, 1
-    )
+            if v: names.append(str(v))
+    rr = first(data, "rating")
+    try: rr = float(rr)
+    except (TypeError, ValueError): rr = None
+    sr = first(data, "starRating", "stars")
+    try: sr = float(sr)
+    except (TypeError, ValueError): sr = None
+    return {"name": first(data, "name", "hotelName", default=""),
+            "address": address_text, "review_rating": rr, "star_rating": sr,
+            "facilities": names}
 
 def amenity_hits(facilities):
     text = " ".join(facilities).lower()
-    hits = []
-    if "laundry" in text or "washer" in text:
-        hits.append("Laundry")
-    if "hot tub" in text or "jacuzzi" in text:
-        hits.append("Hot tub")
-    if "pool" in text:
-        hits.append("Pool")
-    if "ski" in text:
-        hits.append("Ski")
-    if "parking" in text:
-        hits.append("Parking")
-    return hits
+    return [x for key, x in [("laundry","Laundry"),("washer","Laundry"),
+                             ("hot tub","Hot tub"),("jacuzzi","Hot tub"),
+                             ("pool","Pool"),("ski","Ski"),("parking","Parking")]
+            if key in text][:5]
 
-# ---------------- UI ----------------
+def price_score(total, budget):
+    if total <= budget: return 70 + 30*(budget-total)/budget
+    if total <= budget*1.2: return 70 - 40*(total-budget)/(budget*.2)
+    return max(0, 30 - 60*(total-budget*1.2)/budget)
+
+def score_property(row, pref, budget):
+    quality = min(100, max(0, (row.get("review_rating") or 7.5)*10))
+    bw = .15 if pref in ("Required","Preferred") else 0
+    return round(.30*price_score(row["total"], budget)+.20*quality+.15*75+
+                 bw*row["bedroom_score"]+(.15-bw)*75+
+                 .10*(95 if row["refundable"] else 50)+.05*60+.05*55,1)
+
+# Booking comparison
+def parse_money(text):
+    # Prefer amounts explicitly marked with $ or USD, avoiding point counts.
+    m = re.search(r'(?:USD\s*)?\$?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:USD)?', text, re.I)
+    if not m: return None
+    try: return float(m.group(1).replace(",",""))
+    except ValueError: return None
+
+def parse_points(text):
+    for pat in [r'([0-9][0-9,]*)\s*(?:ultimate rewards|UR|chase points|points|pts)\b']:
+        m = re.search(pat, text, re.I)
+        if m:
+            try: return int(m.group(1).replace(",",""))
+            except ValueError: pass
+    return None
+
+def parse_booking(text):
+    return {
+        "cash": parse_money(text),
+        "points": parse_points(text),
+        "refundable": bool(re.search(r'\b(refundable|free cancellation|cancel free)\b', text, re.I)),
+        "boost": (float(m.group(1)) if (m:=re.search(r'(?:points?\s*boost|boost)[^\d]{0,30}(1\.[0-9]+)\s*x', text, re.I)) else None)
+    }
+
+# -------- UI --------
 st.title("✈️ Travel Optimizer")
-st.caption("Phase 2.7 — live rates + property enrichment + configurable preferences")
+st.caption("Phase 3 — live lodging search + configurable preferences + booking strategy")
 
 with st.sidebar:
     st.header("Trip")
     destination = st.text_input("Destination", "Stowe, VT")
-    checkin = st.date_input("Check-in", date(2026, 12, 5))
-    checkout = st.date_input("Check-out", date(2026, 12, 12))
-    adults = st.number_input("Adults", 1, 10, 2)
-    child1 = st.number_input("Child 1 age", 0, 17, 5)
-    child2 = st.number_input("Child 2 age", 0, 17, 7)
-    budget = st.number_input("Target lodging budget (USD)", 100, 20000, 3000, 100)
-    nationality = st.selectbox("Guest nationality", ["US", "CA"], index=0)
-    hotels_to_search = st.slider("Hotels to search", 5, 100, 30)
-
+    checkin = st.date_input("Check-in", date(2026,12,5))
+    checkout = st.date_input("Check-out", date(2026,12,12))
+    adults = st.number_input("Adults",1,10,2)
+    child1 = st.number_input("Child 1 age",0,17,5)
+    child2 = st.number_input("Child 2 age",0,17,7)
+    budget = st.number_input("Target lodging budget (USD)",100,20000,3000,100)
+    nationality = st.selectbox("Guest nationality",["US","CA"],0)
+    hotel_limit = st.slider("Hotels to search",5,100,30)
     st.divider()
-    st.header("Room configuration")
-    bedroom_preference = st.selectbox(
-        "Separate bedroom",
-        ["Required", "Preferred", "No preference"],
-        index=0,
-        help=(
-            "Required = exclude results without evidence of a private bedroom. "
-            "Preferred = keep everything, but favor properties with bedroom evidence. "
-            "No preference = do not use bedroom configuration in the ranking."
-        ),
-    )
-    st.caption(
-        "For this Stowe test, leave it on **Required**. "
-        "For future trips, you can change it without rebuilding the search."
-    )
-
+    bedroom_preference = st.selectbox("Separate bedroom",
+        ["Required","Preferred","No preference"],0,
+        help="Required excludes results without bedroom evidence. Preferred favors them but keeps other results. No preference ignores bedroom configuration.")
     st.divider()
     st.header("Live data connection")
-    st.caption("Use the Nuitee SANDBOX key beginning with `sand_`.")
-    api_key = st.text_input("Sandbox API key", type="password")
-
-    run = st.button("🔎 Search & rank", type="primary", use_container_width=True)
+    st.caption("Use the Nuitee SANDBOX key beginning with sand_.")
+    api_key = st.text_input("Sandbox API key",type="password")
+    run = st.button("🔎 Search & rank",type="primary",use_container_width=True)
 
 if run:
-    if checkout <= checkin:
-        st.error("Check-out must be after check-in.")
-        st.stop()
-    if not api_key:
-        st.error("Paste your Nuitee sandbox API key.")
-        st.stop()
-
-    city = destination.split(",")[0].strip()
-    payload = {
-        "occupancies": [{"adults": int(adults), "children": [int(child1), int(child2)]}],
-        "currency": "USD",
-        "guestNationality": nationality,
-        "checkin": checkin.isoformat(),
-        "checkout": checkout.isoformat(),
-        "cityName": city,
-        "countryCode": "US",
-        "limit": int(hotels_to_search),
-        "maxRatesPerHotel": 5,
-        "roomMapping": True,
-        "includeHotelData": True,
-        "timeout": 10,
-        "sessionId": str(uuid4()),
-    }
-
+    if checkout <= checkin: st.error("Check-out must be after check-in."); st.stop()
+    if not api_key: st.error("Paste your Nuitee sandbox API key."); st.stop()
+    payload = {"occupancies":[{"adults":int(adults),"children":[int(child1),int(child2)]}],
+               "currency":"USD","guestNationality":nationality,
+               "checkin":checkin.isoformat(),"checkout":checkout.isoformat(),
+               "cityName":destination.split(",")[0].strip(),"countryCode":"US",
+               "limit":int(hotel_limit),"maxRatesPerHotel":5,"roomMapping":True,
+               "includeHotelData":True,"timeout":10,"sessionId":str(uuid4())}
     with st.spinner("Searching live rates and enriching properties..."):
         try:
-            raw = api_post("/hotels/rates", payload, api_key)
-            rate_rows = flatten_rates(raw)
-
-            # Group rates by hotel. Pick the best family-compatible rate per property.
-            grouped = {}
-            for r in rate_rows:
-                hid = r["hotel_id"]
-                if not hid:
-                    continue
-                grouped.setdefault(hid, []).append(r)
-
-            properties = []
-            excluded = 0
-
-            for hid, rates in grouped.items():
-                # Required: only return properties with some bedroom evidence.
-                # Preferred: keep all properties, but choose/rank the strongest
-                # configuration first.
-                # No preference: choose the cheapest rate at each property.
-                if bedroom_preference == "Required":
-                    eligible = [r for r in rates if r["bedroom_score"] > 0]
-                    if not eligible:
-                        excluded += 1
-                        continue
-                else:
-                    eligible = rates
-
-                if bedroom_preference == "No preference":
-                    best = min(eligible, key=lambda x: x["total"])
-                else:
-                    best = sorted(
-                        eligible,
-                        key=lambda x: (-x["bedroom_score"], x["total"])
-                    )[0]
-
-                # Current rates responses can already contain brief hotel data.
-                rate_hotel = {}
-                for candidate in (
-                    raw.get("hotels", []) if isinstance(raw, dict) else [],
-                    [x.get("hotelData", {}) for x in (raw.get("data", []) if isinstance(raw, dict) else [])],
-                ):
-                    if not isinstance(candidate, list):
-                        continue
-                    for item in candidate:
-                        if not isinstance(item, dict):
-                            continue
-                        candidate_id = item.get("id") or item.get("hotelId")
-                        if candidate_id == hid:
-                            rate_hotel = item
-                            break
-                    if rate_hotel:
-                        break
-
-                try:
-                    detail_raw = api_get(
-                        "/data/hotel",
-                        api_key,
-                        params={"hotelId": hid, "timeout": 1.5},
-                    )
-                    detail = parse_hotel_detail(detail_raw)
-                except Exception:
-                    detail = {}
-
-                best["hotel_id"] = hid
-                best["name"] = (
-                    detail.get("name")
-                    or rate_hotel.get("name")
-                    or best.get("name")
-                    or f"Hotel {hid}"
-                )
-                best["address"] = (
-                    detail.get("address")
-                    or rate_hotel.get("address")
-                    or best.get("address", "")
-                )
-                best["review_rating"] = (
-                    detail.get("review_rating")
-                    if detail.get("review_rating") is not None
-                    else rate_hotel.get("rating")
-                )
-                best["star_rating"] = (
-                    detail.get("star_rating")
-                    if detail.get("star_rating") is not None
-                    else rate_hotel.get("starRating")
-                )
-                best["facilities"] = detail.get("facilities", [])
-                best["image"] = detail.get("image") or rate_hotel.get("main_photo")
-                best["description"] = detail.get("description", "")
-                best["amenity_hits"] = amenity_hits(best["facilities"])
-                best["bedroom_weight"] = (
-                    0.15 if bedroom_preference in ("Required", "Preferred") else 0.0
-                )
-                best["score"] = score_property(best, budget)
+            raw = api_post("/hotels/rates",payload,api_key)
+            rates = flatten_rates(raw)
+            grouped={}
+            for r in rates:
+                if r["hotel_id"]: grouped.setdefault(r["hotel_id"],[]).append(r)
+            properties=[]; excluded=0
+            for hid, rs in grouped.items():
+                eligible=[r for r in rs if r["bedroom_score"]>0] if bedroom_preference=="Required" else rs
+                if not eligible: excluded+=1; continue
+                best=min(eligible,key=lambda x:x["total"]) if bedroom_preference=="No preference" else sorted(eligible,key=lambda x:(-x["bedroom_score"],x["total"]))[0]
+                try: detail=parse_hotel_detail(api_get("/data/hotel",api_key,{"hotelId":hid}))
+                except Exception: detail={}
+                rd=best.get("rate_hotel_data") or {}
+                best["name"]=detail.get("name") or rd.get("name") or f"Hotel {hid}"
+                best["address"]=detail.get("address") or ""
+                best["review_rating"]=detail.get("review_rating")
+                best["star_rating"]=detail.get("star_rating")
+                best["facilities"]=detail.get("facilities",[])
+                best["amenity_hits"]=amenity_hits(best["facilities"])
+                best["score"]=score_property(best,bedroom_preference,budget)
                 properties.append(best)
-
-            properties.sort(key=lambda x: x["score"], reverse=True)
-            st.session_state["properties"] = properties
-            st.session_state["excluded"] = excluded
-            st.session_state["raw_count"] = len(rate_rows)
-            st.session_state["search_error"] = None
-
+            properties.sort(key=lambda x:x["score"],reverse=True)
+            st.session_state.update(properties=properties,excluded=excluded,raw_count=len(rates),search_error=None,comparison=None)
         except Exception as exc:
-            st.session_state["properties"] = []
-            st.session_state["search_error"] = str(exc)
+            st.session_state.update(properties=[],search_error=str(exc),comparison=None)
 
-error = st.session_state.get("search_error")
-if error:
-    st.error(f"Search failed: {error}")
+if st.session_state.get("search_error"): st.error(f"Search failed: {st.session_state['search_error']}")
+properties=st.session_state.get("properties",[])
 
-properties = st.session_state.get("properties", [])
 if properties:
-    excluded = st.session_state.get("excluded", 0)
-    raw_count = st.session_state.get("raw_count", 0)
-
-    st.success(
-        f"Found {len(properties)} candidate properties from {raw_count} live room-rate options."
-    )
-
-    if bedroom_preference == "Required" and excluded:
-        st.info(
-            f"Filtered out {excluded} properties because none of their returned rooms "
-            "showed evidence of a private bedroom."
-        )
-    elif bedroom_preference == "Preferred":
-        st.info(
-            "Bedroom configuration is being used as a ranking preference, "
-            "but properties without bedroom evidence are still included."
-        )
-    elif bedroom_preference == "No preference":
-        st.info(
-            "Bedroom configuration is not being used as a filter or ranking factor."
-        )
+    st.success(f"Found {len(properties)} candidate properties from {st.session_state.get('raw_count',0)} live room-rate options.")
+    if bedroom_preference=="Required" and st.session_state.get("excluded",0):
+        st.info(f"Filtered out {st.session_state['excluded']} properties because none of their returned rooms showed evidence of a private bedroom.")
+    elif bedroom_preference=="Preferred": st.info("Bedroom configuration is a ranking preference, not a filter.")
+    else: st.info("Bedroom configuration is not being used as a filter or ranking factor.")
 
     st.subheader("🏆 Ranked shortlist")
-
-    for i, p in enumerate(properties[:10], 1):
+    for i,p in enumerate(properties[:10],1):
         with st.container(border=True):
-            c1, c2, c3 = st.columns([5, 2, 2])
-
+            c1,c2,c3=st.columns([5,2,2])
             with c1:
                 st.subheader(f"{i}. {p['name']}")
-                if p["address"]:
-                    st.caption(p["address"])
-
-                room_label = p["room_label"]
-                if p["bedroom_score"] == 100:
-                    st.write(f"**Room:** {p['room']}  ·  🛏️ **{room_label}**")
-                else:
-                    st.write(f"**Room:** {p['room']}  ·  ⚠️ **{room_label}**")
-
-                if p["amenity_hits"]:
-                    st.caption("Amenities: " + " · ".join(p["amenity_hits"]))
-
+                if p["address"]: st.caption(p["address"])
+                st.write(f"**Room:** {p['room']}  ·  {'🛏️' if p['bedroom_score']==100 else '⚠️'} **{p['room_label']}**")
+                if p["amenity_hits"]: st.caption("Amenities: "+" · ".join(p["amenity_hits"]))
             with c2:
-                st.metric("7-night total", f"${p['total']:,.0f}")
+                st.metric("Stay total",f"${p['total']:,.0f}")
                 st.write(f"Optimizer score: **{p['score']}/100**")
-                if p.get("review_rating") is not None:
-                    st.write(f"Guest rating: **{p['review_rating']:.1f}/10**")
-                if p.get("star_rating") is not None:
-                    stars = p["star_rating"]
-                    st.write(f"Hotel class: **{stars:g}/5 stars**")
-
+                if p.get("review_rating") is not None: st.write(f"Guest rating: **{p['review_rating']:.1f}/10**")
+                if p.get("star_rating") is not None: st.write(f"Hotel class: **{p['star_rating']:g}/5 stars**")
             with c3:
-                st.write(
-                    "**Cancellation:** " +
-                    ("Refundable" if p["refundable"] else "Non-refundable / verify")
-                )
-                st.write("**Source:** Nuitee Connect")
-                if p["hotel_id"]:
-                    st.caption(f"Hotel ID: {p['hotel_id']}")
+                st.write("**Cancellation:** "+("Refundable" if p["refundable"] else "Not detected"))
+                st.caption(f"Hotel ID: {p['hotel_id']}")
 
     st.divider()
-    st.subheader("What we're doing now")
-    st.write(
-        "The optimizer now groups room rates by property, enriches each property with Nuitee's "
-        "hotel-content data, and applies the user's selected room-configuration preference. "
-        "Required filters out results without bedroom evidence; Preferred keeps them but favors "
-        "better bedroom configurations; No preference ignores bedroom configuration. "
-        "The next major layer is rewards/platform comparison."
-    )
+    st.subheader("💳 Booking Strategy")
+    st.caption("Add results from sources we cannot reliably query directly. Chase points have a hard 1¢/point cash-out floor.")
 
+    selected_name=st.selectbox("Choose a finalist",[p["name"] for p in properties[:10]],key="booking_property")
+    selected=next(p for p in properties if p["name"]==selected_name)
+    st.write(f"**{selected['name']}** — Nuitee: **${selected['total']:,.0f}**")
+
+    sources=[
+        ("Chase Travel","Paste the exact Chase result. Include cash price, points price, and any Points Boost text."),
+        ("Hyatt","Paste the Hyatt cash and/or award result."),
+        ("Marriott","Paste the Marriott cash and/or award result."),
+        ("IHG","Paste the IHG cash and/or award result."),
+        ("Wyndham","Paste the Wyndham cash and/or award result."),
+        ("Expedia / VRBO","Paste the Expedia or VRBO result, including member pricing if shown."),
+        ("Direct hotel","Paste the direct-booking result.")
+    ]
+    cols=st.columns(2)
+    for idx,(source,help_text) in enumerate(sources):
+        with cols[idx%2]:
+            with st.expander(source,expanded=(source=="Chase Travel")):
+                st.text_area("Paste result",key=f"paste_{source}",height=105,
+                             placeholder="Example: $1,985 or 132,333 points. Free cancellation...",help=help_text)
+                txt=st.session_state.get(f"paste_{source}","")
+                if txt:
+                    q=parse_booking(txt)
+                    st.caption(f"Detected cash: {('$'+format(q['cash'],',.2f')) if q['cash'] is not None else '—'} · Points: {(format(q['points'],',')+' pts') if q['points'] else '—'} · Refundable: {'Yes' if q['refundable'] else 'Not detected'} · Boost: {(str(q['boost'])+'x') if q['boost'] else '—'}")
+
+    if st.button("🧮 Compare booking options",type="primary"):
+        opts=[{"source":"Nuitee","cash":selected["total"],"points":None,"refundable":selected["refundable"]}]
+        for source,_ in sources:
+            txt=st.session_state.get(f"paste_{source}","")
+            if txt.strip():
+                q=parse_booking(txt)
+                opts.append({"source":source,"cash":q["cash"],"points":q["points"],"refundable":q["refundable"]})
+        st.session_state["comparison"]=opts
+
+    comparison=st.session_state.get("comparison")
+    if comparison:
+        st.markdown("#### Comparison")
+        display=[]
+        for x in comparison:
+            cpp=(x["cash"]/x["points"]) if x.get("cash") is not None and x.get("points") else None
+            display.append({"Booking source":x["source"],
+                            "Cash":f"${x['cash']:,.0f}" if x.get("cash") is not None else "—",
+                            "Points":f"{x['points']:,}" if x.get("points") else "—",
+                            "Redemption":f"{cpp*100:.2f}¢/pt" if cpp is not None else "—",
+                            "Cancellation":"Refundable" if x.get("refundable") else "Not detected"})
+        st.dataframe(display,use_container_width=True,hide_index=True)
+
+        point_opts=[]
+        for x in comparison:
+            if x.get("cash") is not None and x.get("points"):
+                x["cpp"]=x["cash"]/x["points"]; point_opts.append(x)
+        if point_opts:
+            best=max(point_opts,key=lambda x:x["cpp"])
+            if best["cpp"]<.01:
+                st.error(f"{best['source']} is below your 1¢/point floor. Paying cash is mathematically better.")
+            elif best["cpp"]<.015:
+                st.info(f"{best['source']} gives {best['cpp']*100:.2f}¢/point. Above your floor, but not automatically better than cash.")
+            else:
+                st.success(f"{best['source']} gives {best['cpp']*100:.2f}¢/point — a strong redemption worth considering.")
+        st.caption("Pasted results are user-supplied and are not independently verified by the app.")
 else:
     st.info("Enter the trip and Nuitee sandbox key, then choose **Search & rank**.")
