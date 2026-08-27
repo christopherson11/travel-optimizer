@@ -163,9 +163,92 @@ def parse_booking(text):
         "boost": (float(m.group(1)) if (m:=re.search(r'(?:points?\s*boost|boost)[^\d]{0,30}(1\.[0-9]+)\s*x', text, re.I)) else None)
     }
 
+
+# -------- Bulk booking-source import --------
+def normalize_name(name):
+    s=(name or '').lower().replace('&','and')
+    s=re.sub(r'[^a-z0-9]+',' ',s)
+    return ' '.join(x for x in s.split() if x not in {'hotel','resort','lodge','inn','the'})
+
+def parse_chase_bulk(text):
+    lines=[re.sub(r'\\s+',' ',x).strip() for x in text.splitlines() if x.strip()]
+    out=[]; i=0
+    while i<len(lines):
+        if i+2<len(lines) and lines[i+1]=='Star rating':
+            name=lines[i]; star=None
+            try: star=float(lines[i+2].split()[0])
+            except: pass
+            j=i+3; rating=None
+            if j<len(lines) and 'Tripadvisor' in lines[j]:
+                m=re.search(r'([0-9.]+)',lines[j]); rating=float(m.group(1)) if m else None
+                j+=1
+                while j<len(lines) and (re.fullmatch(r'[0-9.]+',lines[j]) or re.fullmatch(r'\\([0-9,]+\\)',lines[j])): j+=1
+            chunk=lines[j:j+18]
+            total=pts=orig=due=None; sold=any(x.lower()=='sold out' for x in chunk)
+            for k,x in enumerate(chunk):
+                if x=='All-in total' and k+1<len(chunk): total=parse_money(chunk[k+1])
+                m=re.search(r'Original points\\s+([0-9,]+)',x,re.I)
+                if m: orig=int(m.group(1).replace(',',''))
+                m=re.search(r'new points boost\\s+([0-9,]+)',x,re.I)
+                if m: pts=int(m.group(1).replace(',',''))
+                m=re.search(r'\\$([0-9,]+) due at property',x,re.I)
+                if m: due=float(m.group(1).replace(',',''))
+                if x=='Original points' and k+1<len(chunk):
+                    try: orig=int(chunk[k+1].replace(',',''))
+                    except: pass
+                if x=='new points boost' and k+1<len(chunk):
+                    try: pts=int(chunk[k+1].replace(',',''))
+                    except: pass
+            if total is not None or sold:
+                out.append({'name':name,'source':'Chase Travel','cash':total,'points':pts,'original_points':orig,'due':due,'rating':rating,'star':star,'sold_out':sold})
+                i=j; continue
+        i+=1
+    return out
+
+def parse_expedia_bulk(text):
+    lines=[re.sub(r'\\s+',' ',x).strip() for x in text.splitlines() if x.strip()]
+    out=[]
+    for i,line in enumerate(lines):
+        w=lines[i:i+14]
+        if not any(re.search(r'\\b(?:star|guest rating|reviews)\\b',x,re.I) for x in w): continue
+        if not any('$' in x for x in w): continue
+        if line.startswith('$') or len(line)<4: continue
+        price=None
+        for x in w:
+            if 'total' in x.lower() and '$' in x: price=parse_money(x); break
+        if price is None:
+            vals=[parse_money(x) for x in w if '$' in x]
+            vals=[v for v in vals if v is not None]
+            if vals: price=vals[-1]
+        if price is None: continue
+        rating=None
+        for x in w:
+            m=re.search(r'(?:guest rating|tripadvisor.*?rating|rating)\\s*([0-9.]+)',x,re.I)
+            if m: rating=float(m.group(1)); break
+        refundable=any(re.search(r'fully refundable|free cancellation|reserve now, pay later',x,re.I) for x in w)
+        member=any(re.search(r'member price|sign in for extra savings|vip access',x,re.I) for x in w)
+        key=normalize_name(line)
+        if len(key)>=4 and not any(normalize_name(x['name'])==key for x in out):
+            out.append({'name':line,'source':'Expedia / VRBO','cash':price,'rating':rating,'refundable':refundable,'member':member})
+    return out
+
+def match_source_properties(props, rows):
+    matches=[]
+    for p in props:
+        pn=normalize_name(p.get('name')); pt=set(pn.split()); best=None; score=0
+        for r in rows:
+            rn=normalize_name(r.get('name')); rt=set(rn.split())
+            if pn==rn: sc=1.0
+            else: sc=len(pt&rt)/max(1,len(pt|rt))
+            if pn in rn or rn in pn: sc=max(sc,.85)
+            if sc>score: score=sc; best=r
+        matches.append((p,best,score))
+    return matches
+
+
 # -------- UI --------
 st.title("✈️ Travel Optimizer")
-st.caption("Phase 3 — live lodging search + configurable preferences + booking strategy")
+st.caption("Phase 3.1 — live lodging search + bulk Chase/Expedia matching + booking strategy")
 
 with st.sidebar:
     st.header("Trip")
@@ -252,6 +335,23 @@ if properties:
             with c3:
                 st.write("**Cancellation:** "+("Refundable" if p["refundable"] else "Not detected"))
                 st.caption(f"Hotel ID: {p['hotel_id']}")
+
+    st.divider()
+    st.subheader("📥 Bulk Booking-Source Import")
+    st.caption("Run the same search on Chase Travel and Expedia while logged in, then paste the complete copied results. The app matches them to the Nuitee shortlist.")
+    a,b=st.columns(2)
+    with a: chase_bulk=st.text_area("Chase Travel — full search results",height=240,key="chase_bulk",placeholder="Paste everything exactly as copied.")
+    with b: expedia_bulk=st.text_area("Expedia — full search results",height=240,key="expedia_bulk",placeholder="Paste everything exactly as copied.")
+    if st.button("🔗 Match & Analyze All Sources",type="primary"):
+        st.session_state['bulk_matches']={'chase':match_source_properties(properties,parse_chase_bulk(chase_bulk) if chase_bulk.strip() else []),'expedia':match_source_properties(properties,parse_expedia_bulk(expedia_bulk) if expedia_bulk.strip() else [])}
+    bulk=st.session_state.get('bulk_matches')
+    if bulk:
+        rows=[]
+        for p in properties[:10]:
+            c=next((x[1] for x in bulk['chase'] if x[0] is p),None); e=next((x[1] for x in bulk['expedia'] if x[0] is p),None)
+            rows.append({'Property':p['name'],'Nuitee low':f"${p['total']:,.0f}",'Chase low':(f"${c['cash']:,.0f}" if c and c.get('cash') is not None else ('Sold out' if c and c.get('sold_out') else '—')),'Chase Boost pts':(f"{c['points']:,}" if c and c.get('points') else '—'),'Chase value':(f"{c['cash']/c['points']*100:.2f}¢/pt" if c and c.get('cash') and c.get('points') else '—'),'Expedia low':(f"${e['cash']:,.0f}" if e and e.get('cash') is not None else '—'),'Expedia perks':('Member/VIP' if e and e.get('member') else '—'),'Nuitee room':p['room']})
+        st.dataframe(rows,use_container_width=True,hide_index=True)
+        st.caption('Nuitee is the automated low-rate baseline. Chase and Expedia values are imported from the pasted search summaries; room types remain unverified until a finalist is checked.')
 
     st.divider()
     st.subheader("💳 Booking Strategy")
