@@ -57,17 +57,28 @@ def cancellation(rate):
     return refundable, details
 
 def room_class(room_name, rate):
-    text = " ".join([str(room_name or ""), str(rate.get("roomName") or ""),
-                     str(rate.get("name") or "")]).lower()
-    if re.search(r"\b([2-9]|10)\s*[- ]?bedroom\b", text): return "2+ BR", 100
-    if re.search(r"\b(one|1)\s*[- ]?bedroom\b", text): return "1 BR", 100
-    if any(x in text for x in ("suite", "apartment", "villa", "residence")):
-        return "Suite / residence — verify bedroom", 70
-    if re.search(r"\b(two|2)\s+(double|queen|full)\b", text) or "double bed" in text or "twin bed" in text:
-        return "Standard room — no separate bedroom evidence", 0
-    if re.search(r"\bking\b|\bqueen\b|\bdouble\b|\btwin\b", text):
-        return "Standard room — no separate bedroom evidence", 0
-    return "Configuration unclear — verify bedroom", 30
+    text = " ".join([
+        str(room_name or ""), str(rate.get("roomName") or ""),
+        str(rate.get("name") or "")
+    ]).lower()
+
+    # Explicit bedroom counts first.
+    m = re.search(r"\b([1-9]|10)\s*[- ]?bedroom\b", text)
+    if m:
+        n = int(m.group(1))
+        return f"{n} BR", n
+
+    word_counts = {"one": 1, "two": 2, "three": 3, "four": 4}
+    for word, n in word_counts.items():
+        if re.search(rf"\b{word}\s*[- ]?bedroom\b", text):
+            return f"{n} BR", n
+
+    # Suites/residences are useful candidates, but their bedroom count is not
+    # guaranteed by the word "suite" alone.
+    if any(x in text for x in ("suite", "apartment", "villa", "residence", "condo")):
+        return "Unknown BR — verify", 0
+
+    return "Unknown BR", 0
 
 def flatten_rates(raw):
     rows = []
@@ -134,10 +145,24 @@ def price_score(total, budget):
 
 def score_property(row, pref, budget):
     quality = min(100, max(0, (row.get("review_rating") or 7.5)*10))
-    bw = .15 if pref in ("Required","Preferred") else 0
-    return round(.30*price_score(row["total"], budget)+.20*quality+.15*75+
-                 bw*row["bedroom_score"]+(.15-bw)*75+
-                 .10*(95 if row["refundable"] else 50)+.05*60+.05*55,1)
+    bedroom_bonus = 0
+    if pref != "Any":
+        min_br = int(pref.split("+")[0])
+        if row.get("bedroom_score", 0) >= min_br:
+            bedroom_bonus = 100
+        elif row.get("bedroom_score", 0) == 0:
+            bedroom_bonus = 45
+
+    return round(
+        .30*price_score(row["total"], budget)
+        + .20*quality
+        + .15*75
+        + .15*bedroom_bonus
+        + .10*(95 if row["refundable"] else 50)
+        + .05*60
+        + .05*55, 1
+    )
+
 
 # Booking comparison
 def parse_money(text):
@@ -366,10 +391,79 @@ def match_source_properties(props, rows):
     return matches
 
 
+def merge_external_candidates(nuitee_props, chase_rows, expedia_rows):
+    """Build a master property pool. Nuitee is one contributor, not the gatekeeper."""
+    master = []
+
+    # Start with Nuitee candidates, preserving all of their rich room data.
+    for p in nuitee_props:
+        item = dict(p)
+        item["sources"] = {"Nuitee": p}
+        item["chase_match"] = None
+        item["expedia_match"] = None
+        master.append(item)
+
+    def attach_or_add(rows, source_key):
+        for r in rows:
+            best_idx = None
+            best = 0.0
+            for idx, m in enumerate(master):
+                sc = match_score(m.get("name",""), r.get("name",""))
+                if sc > best:
+                    best = sc; best_idx = idx
+            if best_idx is not None and best >= 0.78:
+                master[best_idx]["sources"][source_key] = r
+                master[best_idx][f"{source_key.lower()}_match"] = r
+            else:
+                # A property found only by Chase/Expedia must still enter the pool.
+                master.append({
+                    "name": r.get("name") or "Unknown property",
+                    "room": "Not supplied by source",
+                    "room_label": "Unknown BR",
+                    "bedroom_score": 0,
+                    "total": r.get("cash") if r.get("cash") is not None else 0,
+                    "currency": "USD",
+                    "refundable": bool(r.get("refundable")),
+                    "cancel_details": [],
+                    "board": "",
+                    "hotel_id": None,
+                    "address": "",
+                    "review_rating": r.get("rating"),
+                    "star_rating": r.get("star"),
+                    "facilities": [],
+                    "amenity_hits": [],
+                    "score": None,
+                    "sources": {source_key: r},
+                    "chase_match": r if source_key == "Chase" else None,
+                    "expedia_match": r if source_key == "Expedia" else None,
+                    "external_only": True
+                })
+
+    attach_or_add(chase_rows, "Chase")
+    attach_or_add(expedia_rows, "Expedia")
+    return master
+
+def source_cash(row, key):
+    r = row.get("sources", {}).get(key)
+    return r.get("cash") if r else None
+
+def source_points(row):
+    r = row.get("sources", {}).get("Chase")
+    return r.get("points") if r else None
+
+def source_due(row):
+    r = row.get("sources", {}).get("Chase")
+    return r.get("due") if r else None
+
+def source_match_label(row):
+    keys = list(row.get("sources", {}).keys())
+    return ", ".join(keys) if keys else "—"
+
+
 # -------- UI --------
 # -------- UI --------
 st.title("✈️ Travel Optimizer")
-st.caption("Phase 3.2 — live lodging search + reliable bulk Chase/Expedia matching + booking strategy")
+st.caption("Phase 4 — master property pool + bulk Chase/Expedia matching + standard bedroom filters")
 
 with st.sidebar:
     st.header("Trip")
@@ -383,9 +477,11 @@ with st.sidebar:
     nationality = st.selectbox("Guest nationality",["US","CA"],0)
     hotel_limit = st.slider("Hotels to search",5,100,30)
     st.divider()
-    bedroom_preference = st.selectbox("Separate bedroom",
-        ["Required","Preferred","No preference"],0,
-        help="Required excludes results without bedroom evidence. Preferred favors them but keeps other results. No preference ignores bedroom configuration.")
+    bedroom_preference = st.selectbox(
+        "Bedrooms",
+        ["Any", "1+", "2+", "3+", "4+"], 1,
+        help="Uses explicit bedroom-count evidence when available. Unknown room configurations remain unverified rather than being treated as a specific bedroom count."
+    )
     st.divider()
     st.header("Live data connection")
     st.caption("Use the Nuitee SANDBOX key beginning with sand_.")
@@ -410,9 +506,15 @@ if run:
                 if r["hotel_id"]: grouped.setdefault(r["hotel_id"],[]).append(r)
             properties=[]; excluded=0
             for hid, rs in grouped.items():
-                eligible=[r for r in rs if r["bedroom_score"]>0] if bedroom_preference=="Required" else rs
-                if not eligible: excluded+=1; continue
-                best=min(eligible,key=lambda x:x["total"]) if bedroom_preference=="No preference" else sorted(eligible,key=lambda x:(-x["bedroom_score"],x["total"]))[0]
+                if bedroom_preference == "Any":
+                    eligible = rs
+                else:
+                    min_br = int(bedroom_preference.split("+")[0])
+                    eligible = [r for r in rs if r["bedroom_score"] >= min_br]
+                if not eligible:
+                    excluded += 1
+                    continue
+                best = min(eligible, key=lambda x:x["total"])
                 try: detail=parse_hotel_detail(api_get("/data/hotel",api_key,{"hotelId":hid}))
                 except Exception: detail={}
                 rd=best.get("rate_hotel_data") or {}
@@ -434,10 +536,10 @@ properties=st.session_state.get("properties",[])
 
 if properties:
     st.success(f"Found {len(properties)} candidate properties from {st.session_state.get('raw_count',0)} live room-rate options.")
-    if bedroom_preference=="Required" and st.session_state.get("excluded",0):
-        st.info(f"Filtered out {st.session_state['excluded']} properties because none of their returned rooms showed evidence of a private bedroom.")
-    elif bedroom_preference=="Preferred": st.info("Bedroom configuration is a ranking preference, not a filter.")
-    else: st.info("Bedroom configuration is not being used as a filter or ranking factor.")
+    if bedroom_preference != "Any" and st.session_state.get("excluded",0):
+        st.info(f"Filtered out {st.session_state['excluded']} properties because the returned rooms did not show the requested bedroom count.")
+    else:
+        st.info(f"Bedroom filter: **{bedroom_preference}**. Room configurations without explicit bedroom evidence are shown as unverified.")
 
     st.subheader("🏆 Ranked shortlist")
     for i,p in enumerate(properties[:10],1):
@@ -446,7 +548,7 @@ if properties:
             with c1:
                 st.subheader(f"{i}. {p['name']}")
                 if p["address"]: st.caption(p["address"])
-                st.write(f"**Room:** {p['room']}  ·  {'🛏️' if p['bedroom_score']==100 else '⚠️'} **{p['room_label']}**")
+                st.write(f"**Room:** {p['room']}  ·  {'🛏️' if p['bedroom_score']>0 else '⚠️'} **{p['room_label']}**")
                 if p["amenity_hits"]: st.caption("Amenities: "+" · ".join(p["amenity_hits"]))
             with c2:
                 st.metric("Stay total",f"${p['total']:,.0f}")
@@ -459,20 +561,88 @@ if properties:
 
     st.divider()
     st.subheader("📥 Bulk Booking-Source Import")
-    st.caption("Run the same search on Chase Travel and Expedia while logged in, then paste the complete copied results. The app matches them to the Nuitee shortlist.")
+    st.caption(
+        "Paste the complete Chase and/or Expedia search results. These sources can add "
+        "properties that Nuitee did not return; Nuitee is no longer the gatekeeper."
+    )
     a,b=st.columns(2)
-    with a: chase_bulk=st.text_area("Chase Travel — full search results",height=240,key="chase_bulk",placeholder="Paste everything exactly as copied.")
-    with b: expedia_bulk=st.text_area("Expedia — full search results",height=240,key="expedia_bulk",placeholder="Paste everything exactly as copied.")
-    if st.button("🔗 Match & Analyze All Sources",type="primary"):
-        st.session_state['bulk_matches']={'chase':match_source_properties(properties,parse_chase_bulk(chase_bulk) if chase_bulk.strip() else []),'expedia':match_source_properties(properties,parse_expedia_bulk(expedia_bulk) if expedia_bulk.strip() else [])}
-    bulk=st.session_state.get('bulk_matches')
-    if bulk:
-        rows=[]
-        for p in properties[:10]:
-            c=next((x[1] for x in bulk['chase'] if x[0] is p),None); e=next((x[1] for x in bulk['expedia'] if x[0] is p),None)
-            rows.append({'Property':p['name'],'Nuitee low':f"${p['total']:,.0f}",'Chase low':(f"${c['cash']:,.0f}" if c and c.get('cash') is not None else ('Sold out' if c and c.get('sold_out') else '—')),'Chase Boost pts':(f"{c['points']:,}" if c and c.get('points') else '—'),'Chase value':(f"{c['cash']/c['points']*100:.2f}¢/pt" if c and c.get('cash') and c.get('points') else '—'),'Expedia low':(f"${e['cash']:,.0f}" if e and e.get('cash') is not None else '—'),'Expedia perks':('Member/VIP' if e and e.get('member') else '—'),'Nuitee room':p['room']})
-        st.dataframe(rows,use_container_width=True,hide_index=True)
-        st.caption('Nuitee is the automated low-rate baseline. Chase and Expedia values are imported from the pasted search summaries; room types remain unverified until a finalist is checked.')
+    with a:
+        chase_bulk=st.text_area(
+            "Chase Travel — full search results", height=240, key="chase_bulk",
+            placeholder="Paste everything exactly as copied."
+        )
+    with b:
+        expedia_bulk=st.text_area(
+            "Expedia — full search results", height=240, key="expedia_bulk",
+            placeholder="Paste everything exactly as copied."
+        )
+
+    if st.button("🔗 Build Master Property Pool",type="primary"):
+        chase_rows = parse_chase_bulk(chase_bulk) if chase_bulk.strip() else []
+        exp_rows = parse_expedia_bulk(expedia_bulk) if expedia_bulk.strip() else []
+        master = merge_external_candidates(properties, chase_rows, exp_rows)
+        st.session_state["master_pool"] = master
+        st.session_state["bulk_counts"] = {
+            "chase": len(chase_rows), "expedia": len(exp_rows)
+        }
+
+    master = st.session_state.get("master_pool")
+    if master:
+        counts = st.session_state.get("bulk_counts", {})
+        st.success(
+            f"Master pool: **{len(master)} properties** "
+            f"({len(properties)} from Nuitee + {counts.get('chase',0)} Chase results + "
+            f"{counts.get('expedia',0)} Expedia results, after matching/deduplication)."
+        )
+
+        display=[]
+        for p in master:
+            c=p.get("sources",{}).get("Chase")
+            e=p.get("sources",{}).get("Expedia")
+            n=p.get("sources",{}).get("Nuitee")
+            chase_cash = c.get("cash") if c else None
+            exp_cash = e.get("cash") if e else None
+            n_cash = n.get("total") if n else None
+            chase_pts = c.get("points") if c else None
+            due = c.get("due") if c else None
+            cpp = ((chase_cash-(due or 0))/chase_pts*100) if chase_cash and chase_pts else None
+
+            display.append({
+                "Property": p["name"],
+                "Sources": source_match_label(p),
+                "Nuitee low": f"${n_cash:,.0f}" if n_cash is not None else "—",
+                "Chase low": f"${chase_cash:,.0f}" if chase_cash is not None else ("Sold out" if c and c.get("sold_out") else "—"),
+                "Chase Boost pts": f"{chase_pts:,}" if chase_pts else "—",
+                "Chase value": f"{cpp:.2f}¢/pt" if cpp is not None else "—",
+                "Expedia low": f"${exp_cash:,.0f}" if exp_cash is not None else "—",
+                "Room evidence": p.get("room_label","Unknown BR")
+            })
+        st.dataframe(display,use_container_width=True,hide_index=True)
+
+        st.caption(
+            "A property can enter the master pool from any source. "
+            "Prices are source-specific lowest rates unless a room-level result is later verified."
+        )
+
+        st.markdown("#### 🔎 Best apparent opportunities")
+        # Simple source-agnostic cash view: lowest known cash price among all sources.
+        candidates=[]
+        for p in master:
+            prices=[]
+            n=p.get("sources",{}).get("Nuitee")
+            c=p.get("sources",{}).get("Chase")
+            e=p.get("sources",{}).get("Expedia")
+            if n and n.get("total") is not None: prices.append(("Nuitee",n["total"]))
+            if c and c.get("cash") is not None: prices.append(("Chase",c["cash"]))
+            if e and e.get("cash") is not None: prices.append(("Expedia",e["cash"]))
+            if prices:
+                best_source,best_cash=min(prices,key=lambda x:x[1])
+                candidates.append((best_cash,p,best_source))
+        for best_cash,p,best_source in sorted(candidates,key=lambda x:x[0])[:8]:
+            st.write(
+                f"**{p['name']}** — lowest imported cash: **${best_cash:,.0f} via {best_source}** "
+                f"· sources: {source_match_label(p)} · room: {p.get('room_label','Unknown BR')}"
+            )
 
     st.divider()
     st.subheader("💳 Booking Strategy")
