@@ -170,79 +170,146 @@ def normalize_name(name):
     s=re.sub(r'[^a-z0-9]+',' ',s)
     return ' '.join(x for x in s.split() if x not in {'hotel','resort','lodge','inn','the'})
 
+def _clean_line(x):
+    return re.sub(r'\s+', ' ', x).strip().strip('*').strip()
+
+def _is_generic_chase_line(x):
+    low=x.lower().strip()
+    return low in {
+        'primary image','points boost','property amenity','property amenities',
+        'ad','svg','svgsvg','image','star rating','original points',
+        'new points boost','or','nightly average*','all-in total'
+    } or low.startswith('photo gallery')
+
 def parse_chase_bulk(text):
-    lines=[re.sub(r'\\s+',' ',x).strip() for x in text.splitlines() if x.strip()]
-    out=[]; i=0
-    while i<len(lines):
-        if i+2<len(lines) and lines[i+1]=='Star rating':
-            name=lines[i]; star=None
-            try: star=float(lines[i+2].split()[0])
-            except: pass
-            j=i+3; rating=None
-            if j<len(lines) and 'Tripadvisor' in lines[j]:
-                m=re.search(r'([0-9.]+)',lines[j]); rating=float(m.group(1)) if m else None
-                j+=1
-                while j<len(lines) and (re.fullmatch(r'[0-9.]+',lines[j]) or re.fullmatch(r'\\([0-9,]+\\)',lines[j])): j+=1
-            chunk=lines[j:j+18]
-            total=pts=orig=due=None; sold=any(x.lower()=='sold out' for x in chunk)
-            for k,x in enumerate(chunk):
-                if x=='All-in total' and k+1<len(chunk): total=parse_money(chunk[k+1])
-                m=re.search(r'Original points\\s+([0-9,]+)',x,re.I)
-                if m: orig=int(m.group(1).replace(',',''))
-                m=re.search(r'new points boost\\s+([0-9,]+)',x,re.I)
-                if m: pts=int(m.group(1).replace(',',''))
-                m=re.search(r'\\$([0-9,]+) due at property',x,re.I)
-                if m: due=float(m.group(1).replace(',',''))
-                if x=='Original points' and k+1<len(chunk):
-                    try: orig=int(chunk[k+1].replace(',',''))
-                    except: pass
-                if x=='new points boost' and k+1<len(chunk):
-                    try: pts=int(chunk[k+1].replace(',',''))
-                    except: pass
-            if total is not None or sold:
-                out.append({'name':name,'source':'Chase Travel','cash':total,'points':pts,'original_points':orig,'due':due,'rating':rating,'star':star,'sold_out':sold})
-                i=j; continue
-        i+=1
+    lines=[_clean_line(x) for x in text.splitlines() if _clean_line(x)]
+    out=[]
+    # Find each "Star rating" marker. The property name is the closest
+    # preceding non-generic line, which handles amenity/image labels.
+    stars=[i for i,x in enumerate(lines) if x.lower()=='star rating']
+    for n,si in enumerate(stars):
+        next_si=stars[n+1] if n+1<len(stars) else len(lines)
+        prev_candidates=[]
+        for k in range(si-1,max(-1,si-8),-1):
+            if not _is_generic_chase_line(lines[k]) and not lines[k].startswith('$'):
+                prev_candidates.append(lines[k])
+        if not prev_candidates: continue
+        name=prev_candidates[0]
+        chunk=lines[si:next_si]
+        star=None; rating=None; total=None; pts=None; orig=None; due=None
+        if len(chunk)>1:
+            m=re.search(r'([0-9]+(?:\.[0-9]+)?)\s*star',chunk[1],re.I)
+            if m: star=float(m.group(1))
+        for j,x in enumerate(chunk):
+            m=re.search(r'(?:Tripadvisor(?:s)? rating|Tripadvisor).*?([0-9]+(?:\.[0-9]+)?)',x,re.I)
+            if m and rating is None: rating=float(m.group(1))
+            if x.lower()=='all-in total' and j+1<len(chunk): total=parse_money(chunk[j+1])
+            m=re.search(r'Original points\s*([0-9,]+)',x,re.I)
+            if m: orig=int(m.group(1).replace(',',''))
+            m=re.search(r'new points boost\s*([0-9,]+)',x,re.I)
+            if m: pts=int(m.group(1).replace(',',''))
+            m=re.search(r'\$([0-9,]+)\s*due at property',x,re.I)
+            if m: due=float(m.group(1).replace(',',''))
+        # Chase often repeats the point numbers on their own lines.
+        if orig is None:
+            for j,x in enumerate(chunk):
+                if x.lower()=='original points' and j+1<len(chunk):
+                    m=re.search(r'[0-9,]+',chunk[j+1]); orig=int(m.group(0).replace(',','')) if m else None
+        if pts is None:
+            for j,x in enumerate(chunk):
+                if x.lower()=='new points boost' and j+1<len(chunk):
+                    m=re.search(r'[0-9,]+',chunk[j+1]); pts=int(m.group(0).replace(',','')) if m else None
+        sold=any(x.lower()=='sold out' for x in chunk)
+        if total is not None or sold:
+            out.append({'name':name,'source':'Chase Travel','cash':total,'points':pts,
+                        'original_points':orig,'due':due,'rating':rating,'star':star,
+                        'sold_out':sold,'boost':bool(pts and orig)})
     return out
 
 def parse_expedia_bulk(text):
-    lines=[re.sub(r'\\s+',' ',x).strip() for x in text.splitlines() if x.strip()]
+    lines=[_clean_line(x) for x in text.splitlines() if _clean_line(x)]
     out=[]
-    for i,line in enumerate(lines):
-        w=lines[i:i+14]
-        if not any(re.search(r'\\b(?:star|guest rating|reviews)\\b',x,re.I) for x in w): continue
-        if not any('$' in x for x in w): continue
-        if line.startswith('$') or len(line)<4: continue
-        price=None
-        for x in w:
-            if 'total' in x.lower() and '$' in x: price=parse_money(x); break
-        if price is None:
-            vals=[parse_money(x) for x in w if '$' in x]
-            vals=[v for v in vals if v is not None]
-            if vals: price=vals[-1]
-        if price is None: continue
-        rating=None
-        for x in w:
-            m=re.search(r'(?:guest rating|tripadvisor.*?rating|rating)\\s*([0-9.]+)',x,re.I)
-            if m: rating=float(m.group(1)); break
-        refundable=any(re.search(r'fully refundable|free cancellation|reserve now, pay later',x,re.I) for x in w)
-        member=any(re.search(r'member price|sign in for extra savings|vip access',x,re.I) for x in w)
-        key=normalize_name(line)
-        if len(key)>=4 and not any(normalize_name(x['name'])==key for x in out):
-            out.append({'name':line,'source':'Expedia / VRBO','cash':price,'rating':rating,'refundable':refundable,'member':member})
+    # Prefer explicit "Photo gallery for ..." markers because they are an
+    # excellent card boundary in Expedia's copied page text.
+    starts=[]
+    for i,x in enumerate(lines):
+        m=re.search(r'photo gallery for\s+(.+?)(?:show previous|$)',x,re.I)
+        if m: starts.append((i,m.group(1).strip('* ')))
+    if starts:
+        for n,(si,name) in enumerate(starts):
+            ei=starts[n+1][0] if n+1<len(starts) else len(lines)
+            chunk=lines[si:ei]
+            joined=' '.join(chunk)
+            total=None
+            for j,x in enumerate(chunk):
+                if re.search(r'current price is',x,re.I) and '$' in x:
+                    total=parse_money(x); break
+                if re.fullmatch(r'\$[0-9,]+ total',x,re.I):
+                    total=parse_money(x); break
+            if total is None:
+                vals=[parse_money(x) for x in chunk if '$' in x and 'previous price' not in x.lower()]
+                vals=[v for v in vals if v is not None]
+                if vals: total=max(vals) if len(vals)>1 else vals[0]
+            rating=None
+            for x in chunk:
+                m=re.search(r'(?:guest rating|tripadvisor.*?rating)\s*([0-9]+(?:\.[0-9]+)?)',x,re.I)
+                if m: rating=float(m.group(1)); break
+            refundable=bool(re.search(r'fully refundable|free cancellation|reserve now, pay later',joined,re.I))
+            member=bool(re.search(r'member price|sign in for extra savings|vip access|one key silver',joined,re.I))
+            discount=None
+            m=re.search(r'member price\s*\$([0-9,]+)\s*off',joined,re.I)
+            if m: discount=float(m.group(1).replace(',',''))
+            # Pull Expedia hotel id from the property-information URL when present.
+            hotel_id=None
+            m=re.search(r'\.h(\d+)\.Hotel-Information',joined,re.I)
+            if m: hotel_id=m.group(1)
+            sold=bool(re.search(r'\bsold out\b',joined,re.I))
+            if total is not None or sold:
+                out.append({'name':name,'source':'Expedia / VRBO','cash':total,'rating':rating,
+                            'refundable':refundable,'member':member,'discount':discount,
+                            'hotel_id':hotel_id,'sold_out':sold})
+        return out
+
+    # Fallback for copied text without the photo-gallery markers: look for
+    # explicit "X in new tab" / property-information URLs and nearby prices.
+    for i,x in enumerate(lines):
+        if not re.search(r'Hotel-Information',x,re.I): continue
+        w=lines[max(0,i-20):i+2]; joined=' '.join(w)
+        mname=None
+        for y in reversed(w):
+            if y.lower() not in {'stowe','more information about'} and not y.startswith('http') and '$' not in y:
+                if len(y)>3: mname=y; break
+        total=None
+        mt=re.search(r'(?:current price is|total)\s*\$([0-9,]+)',joined,re.I)
+        if mt: total=float(mt.group(1).replace(',',''))
+        if total is not None and mname:
+            out.append({'name':mname,'source':'Expedia / VRBO','cash':total,'rating':None,
+                        'refundable':bool(re.search(r'fully refundable|free cancellation',joined,re.I)),
+                        'member':bool(re.search(r'member price|one key silver|vip access',joined,re.I)),
+                        'discount':None,'hotel_id':None,'sold_out':False})
     return out
 
 def match_source_properties(props, rows):
     matches=[]
     for p in props:
-        pn=normalize_name(p.get('name')); pt=set(pn.split()); best=None; score=0
+        pn=normalize_name(p.get('name')); pt=set(pn.split())
+        best=None; best_score=0.0
         for r in rows:
             rn=normalize_name(r.get('name')); rt=set(rn.split())
+            if not rn: continue
             if pn==rn: sc=1.0
-            else: sc=len(pt&rt)/max(1,len(pt|rt))
-            if pn in rn or rn in pn: sc=max(sc,.85)
-            if sc>score: score=sc; best=r
-        matches.append((p,best,score))
+            elif pn in rn or rn in pn: sc=.92
+            else:
+                inter=len(pt&rt)
+                sc=inter/max(1,len(pt|rt))
+                # Strong boost when the distinctive tokens all agree.
+                if len(pt&rt)>=2: sc=max(sc, .80)
+            if sc>best_score:
+                best_score=sc; best=r
+        # Do not force a weak match. This prevents one wrong property from
+        # being assigned another hotel's price.
+        if best_score < .60: best=None
+        matches.append((p,best,best_score))
     return matches
 
 
