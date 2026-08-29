@@ -463,7 +463,7 @@ def source_match_label(row):
 # -------- UI --------
 # -------- UI --------
 st.title("✈️ Travel Optimizer")
-st.caption("Phase 4 — master property pool + bulk Chase/Expedia matching + standard bedroom filters")
+st.caption("Phase 4.1 — master property pool + competitive Chase point valuation")
 
 with st.sidebar:
     st.header("Trip")
@@ -600,28 +600,60 @@ if properties:
             c=p.get("sources",{}).get("Chase")
             e=p.get("sources",{}).get("Expedia")
             n=p.get("sources",{}).get("Nuitee")
-            chase_cash = c.get("cash") if c else None
-            exp_cash = e.get("cash") if e else None
+
             n_cash = n.get("total") if n else None
-            chase_pts = c.get("points") if c else None
-            due = c.get("due") if c else None
-            cpp = ((chase_cash-(due or 0))/chase_pts*100) if chase_cash and chase_pts else None
+            c_cash = c.get("cash") if c else None
+            e_cash = e.get("cash") if e else None
+            c_pts = c.get("points") if c else None
+            c_due = c.get("due") if c else None
+
+            # Lowest known cash alternative. For Chase, compare the rate that
+            # is actually paid in cash against the points-covered portion.
+            cash_options = []
+            if n_cash is not None and n_cash > 0:
+                cash_options.append(("Nuitee", n_cash))
+            if e_cash is not None and e_cash > 0:
+                cash_options.append(("Expedia", e_cash))
+            if c_cash is not None and c_cash > 0:
+                cash_options.append(("Chase", c_cash))
+
+            best_cash_source, best_cash = min(cash_options, key=lambda x:x[1]) if cash_options else (None, None)
+
+            portal_cpp = None
+            competitive_cpp = None
+            if c_pts and c_pts > 0 and c_cash is not None:
+                portal_cpp = ((c_cash - (c_due or 0)) / c_pts) * 100
+                if best_cash is not None:
+                    # Use the best cash alternative across sources. If that
+                    # alternative is itself Chase, this equals portal value.
+                    competitive_cpp = ((best_cash - (c_due or 0) if best_cash_source == "Chase"
+                                        else best_cash) / c_pts) * 100
 
             display.append({
                 "Property": p["name"],
                 "Sources": source_match_label(p),
+                "Best cash": f"${best_cash:,.0f}" if best_cash is not None else "—",
+                "Best cash source": best_cash_source or "—",
                 "Nuitee low": f"${n_cash:,.0f}" if n_cash is not None else "—",
-                "Chase low": f"${chase_cash:,.0f}" if chase_cash is not None else ("Sold out" if c and c.get("sold_out") else "—"),
-                "Chase Boost pts": f"{chase_pts:,}" if chase_pts else "—",
-                "Chase value": f"{cpp:.2f}¢/pt" if cpp is not None else "—",
-                "Expedia low": f"${exp_cash:,.0f}" if exp_cash is not None else "—",
+                "Chase low": f"${c_cash:,.0f}" if c_cash is not None else ("Sold out" if c and c.get("sold_out") else "—"),
+                "Chase Boost pts": f"{c_pts:,}" if c_pts else "—",
+                "Chase portal value": f"{portal_cpp:.2f}¢/pt" if portal_cpp is not None else "—",
+                "Chase competitive value": f"{competitive_cpp:.2f}¢/pt" if competitive_cpp is not None else "—",
+                "Expedia low": f"${e_cash:,.0f}" if e_cash is not None else "—",
                 "Room evidence": p.get("room_label","Unknown BR")
             })
+
         st.dataframe(display,use_container_width=True,hide_index=True)
 
         st.caption(
             "A property can enter the master pool from any source. "
             "Prices are source-specific lowest rates unless a room-level result is later verified."
+        )
+        st.info(
+            "**Chase competitive value** compares the Chase points requirement against the "
+            "**lowest known cash price from any source**. This is the number the optimizer "
+            "should use when deciding whether a Chase redemption is attractive. "
+            "The Chase portal value is shown separately for comparison."
         )
 
         st.markdown("#### 🔎 Best apparent opportunities")
@@ -639,9 +671,15 @@ if properties:
                 best_source,best_cash=min(prices,key=lambda x:x[1])
                 candidates.append((best_cash,p,best_source))
         for best_cash,p,best_source in sorted(candidates,key=lambda x:x[0])[:8]:
+            c=p.get("sources",{}).get("Chase")
+            competitive = None
+            if c and c.get("points"):
+                due = c.get("due") or 0
+                competitive = ((best_cash - due) if best_source == "Chase" else best_cash) / c["points"] * 100
+            chase_text = f" · Chase competitive value: **{competitive:.2f}¢/pt**" if competitive is not None else ""
             st.write(
-                f"**{p['name']}** — lowest imported cash: **${best_cash:,.0f} via {best_source}** "
-                f"· sources: {source_match_label(p)} · room: {p.get('room_label','Unknown BR')}"
+                f"**{p['name']}** — lowest imported cash: **${best_cash:,.0f} via {best_source}**"
+                f"{chase_text} · sources: {source_match_label(p)} · room: {p.get('room_label','Unknown BR')}"
             )
 
     st.divider()
