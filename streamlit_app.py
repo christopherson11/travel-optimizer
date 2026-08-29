@@ -165,65 +165,97 @@ def parse_booking(text):
 
 
 # -------- Bulk booking-source import --------
-def normalize_name(name):
-    s=(name or '').lower().replace('&','and')
-    s=re.sub(r'[^a-z0-9]+',' ',s)
-    return ' '.join(x for x in s.split() if x not in {'hotel','resort','lodge','inn','the'})
-
 def _clean_line(x):
-    return re.sub(r'\s+', ' ', x).strip().strip('*').strip()
+    return re.sub(r"\s+", " ", str(x)).strip()
 
 def _is_generic_chase_line(x):
-    low=x.lower().strip()
-    return low in {
-        'primary image','points boost','property amenity','property amenities',
-        'ad','svg','svgsvg','image','star rating','original points',
-        'new points boost','or','nightly average*','all-in total'
-    } or low.startswith('photo gallery')
+    return x.lower() in {"primary image", "pool", "points boost", "property amenity", "indoor pool", "exterior", "room", "fitness facility", "terrace/patio", "star rating"}
+
+def normalize_name(name):
+    s = (name or "").lower().replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    # These words are too generic to identify a hotel. Removing them prevents
+    # false matches such as "Tälta Lodge" -> "The Lodge at Spruce Peak".
+    stop = {
+        "the", "hotel", "hotels", "resort", "resorts", "lodge", "lodges", "inn",
+        "and", "a", "an", "at", "by", "of", "on", "in", "the", "family",
+        "destination", "residence", "residences"
+    }
+    return " ".join(x for x in s.split() if x not in stop)
 
 def parse_chase_bulk(text):
-    lines=[_clean_line(x) for x in text.splitlines() if _clean_line(x)]
-    out=[]
-    # Find each "Star rating" marker. The property name is the closest
-    # preceding non-generic line, which handles amenity/image labels.
-    stars=[i for i,x in enumerate(lines) if x.lower()=='star rating']
-    for n,si in enumerate(stars):
-        next_si=stars[n+1] if n+1<len(stars) else len(lines)
-        prev_candidates=[]
-        for k in range(si-1,max(-1,si-8),-1):
-            if not _is_generic_chase_line(lines[k]) and not lines[k].startswith('$'):
-                prev_candidates.append(lines[k])
-        if not prev_candidates: continue
-        name=prev_candidates[0]
-        chunk=lines[si:next_si]
-        star=None; rating=None; total=None; pts=None; orig=None; due=None
-        if len(chunk)>1:
-            m=re.search(r'([0-9]+(?:\.[0-9]+)?)\s*star',chunk[1],re.I)
-            if m: star=float(m.group(1))
-        for j,x in enumerate(chunk):
-            m=re.search(r'(?:Tripadvisor(?:s)? rating|Tripadvisor).*?([0-9]+(?:\.[0-9]+)?)',x,re.I)
-            if m and rating is None: rating=float(m.group(1))
-            if x.lower()=='all-in total' and j+1<len(chunk): total=parse_money(chunk[j+1])
-            m=re.search(r'Original points\s*([0-9,]+)',x,re.I)
-            if m: orig=int(m.group(1).replace(',',''))
-            m=re.search(r'new points boost\s*([0-9,]+)',x,re.I)
-            if m: pts=int(m.group(1).replace(',',''))
-            m=re.search(r'\$([0-9,]+)\s*due at property',x,re.I)
-            if m: due=float(m.group(1).replace(',',''))
-        # Chase often repeats the point numbers on their own lines.
+    # Chase cards are reliably delimited by "Points Boost". The property name
+    # is the line immediately following that marker.
+    lines = [_clean_line(x) for x in text.splitlines() if _clean_line(x)]
+    out = []
+    positions = [i for i, x in enumerate(lines) if x.lower() == "points boost"]
+
+    for n, pos in enumerate(positions):
+        end = positions[n + 1] if n + 1 < len(positions) else len(lines)
+        block = lines[pos:end]
+        if pos + 1 >= len(lines):
+            continue
+
+        name = lines[pos + 1]
+        if _is_generic_chase_line(name) or name.lower() in {"star rating", "sold out"}:
+            continue
+
+        total = orig = pts = due = star = rating = None
+        for j, x in enumerate(block):
+            if x.lower() == "all-in total" and j + 1 < len(block):
+                total = parse_money(block[j + 1])
+
+            m = re.search(r'Original points\s*([0-9,]+)', x, re.I)
+            if m:
+                orig = int(m.group(1).replace(",", ""))
+
+            m = re.search(r'new points boost\s*([0-9,]+)', x, re.I)
+            if m:
+                pts = int(m.group(1).replace(",", ""))
+
+            m = re.search(r'\$([0-9,]+(?:\.[0-9]+)?)\s*due at property', x, re.I)
+            if m:
+                due = float(m.group(1).replace(",", ""))
+
+            m = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)\s*star', x, re.I)
+            if m:
+                star = float(m.group(1))
+
+            m = re.search(r'(?:Tripadvisors? rating|Tripadvisor).*?([0-9]+(?:\.[0-9]+)?)', x, re.I)
+            if m and rating is None:
+                rating = float(m.group(1))
+
+        # Chase repeats the point counts as standalone lines after "or".
         if orig is None:
-            for j,x in enumerate(chunk):
-                if x.lower()=='original points' and j+1<len(chunk):
-                    m=re.search(r'[0-9,]+',chunk[j+1]); orig=int(m.group(0).replace(',','')) if m else None
-        if pts is None:
-            for j,x in enumerate(chunk):
-                if x.lower()=='new points boost' and j+1<len(chunk):
-                    m=re.search(r'[0-9,]+',chunk[j+1]); pts=int(m.group(0).replace(',','')) if m else None
-        sold=any(x.lower()=='sold out' for x in chunk)
+            for j, x in enumerate(block):
+                if x.lower() == "or" and j + 1 < len(block):
+                    m = re.fullmatch(r'([0-9,]+)', block[j + 1])
+                    if m:
+                        orig = int(m.group(1).replace(",", ""))
+                        break
+
+        if pts is None and orig is not None:
+            # Find the first different standalone integer after the original count.
+            for j, x in enumerate(block):
+                if x.replace(",", "") == str(orig):
+                    for y in block[j + 1:j + 5]:
+                        m = re.fullmatch(r'([0-9,]+)', y)
+                        if m:
+                            candidate = int(m.group(1).replace(",", ""))
+                            if candidate != orig:
+                                pts = candidate
+                                break
+                    if pts is not None:
+                        break
+
+        sold = any(x.lower() == "sold out" for x in block)
         if total is not None or sold:
-            out.append({'name':name,'source':'Chase Travel','cash':total,'points':pts,
-                        'original_points':orig,'due':due,'rating':rating,'star':star,
-                        'sold_out':sold,'boost':bool(pts and orig)})
+            out.append({
+                "name": name, "source": "Chase Travel", "cash": total,
+                "points": pts, "original_points": orig, "due": due,
+                "rating": rating, "star": star, "sold_out": sold,
+                "boost": bool(pts and orig)
+            })
     return out
 
 def parse_expedia_bulk(text):
@@ -289,33 +321,55 @@ def parse_expedia_bulk(text):
                         'discount':None,'hotel_id':None,'sold_out':False})
     return out
 
+def match_score(a, b):
+    aa = normalize_name(a)
+    bb = normalize_name(b)
+    if not aa or not bb:
+        return 0.0
+    if aa == bb:
+        return 1.0
+
+    at, bt = set(aa.split()), set(bb.split())
+    inter = at & bt
+    if not inter:
+        return 0.0
+
+    # Exact/near-exact distinctive-token containment is strong. Otherwise use
+    # Jaccard overlap. Never promote a match merely because two generic words
+    # (e.g. "a", "by", "lodge") happen to overlap.
+    jaccard = len(inter) / max(1, len(at | bt))
+    containment = len(inter) / max(1, min(len(at), len(bt)))
+
+    if containment >= 1.0:
+        return 0.92
+    if jaccard >= 0.50:
+        return min(0.90, jaccard + 0.20)
+    return jaccard
+
 def match_source_properties(props, rows):
-    matches=[]
+    matches = []
     for p in props:
-        pn=normalize_name(p.get('name')); pt=set(pn.split())
-        best=None; best_score=0.0
+        best = None
+        best_score = 0.0
         for r in rows:
-            rn=normalize_name(r.get('name')); rt=set(rn.split())
-            if not rn: continue
-            if pn==rn: sc=1.0
-            elif pn in rn or rn in pn: sc=.92
-            else:
-                inter=len(pt&rt)
-                sc=inter/max(1,len(pt|rt))
-                # Strong boost when the distinctive tokens all agree.
-                if len(pt&rt)>=2: sc=max(sc, .80)
-            if sc>best_score:
-                best_score=sc; best=r
-        # Do not force a weak match. This prevents one wrong property from
-        # being assigned another hotel's price.
-        if best_score < .60: best=None
-        matches.append((p,best,best_score))
+            sc = match_score(p.get("name"), r.get("name"))
+            if sc > best_score:
+                best_score = sc
+                best = r
+
+        # Conservative threshold: an unmatched hotel is preferable to a
+        # phantom price/points match.
+        if best_score < 0.78:
+            best = None
+            best_score = 0.0
+        matches.append((p, best, best_score))
     return matches
 
 
 # -------- UI --------
+# -------- UI --------
 st.title("✈️ Travel Optimizer")
-st.caption("Phase 3.1 — live lodging search + bulk Chase/Expedia matching + booking strategy")
+st.caption("Phase 3.2 — live lodging search + reliable bulk Chase/Expedia matching + booking strategy")
 
 with st.sidebar:
     st.header("Trip")
