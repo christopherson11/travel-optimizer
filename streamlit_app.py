@@ -209,78 +209,149 @@ def normalize_name(name):
     return " ".join(x for x in s.split() if x not in stop)
 
 def parse_chase_bulk(text):
-    # Chase cards are reliably delimited by "Points Boost". The property name
-    # is the line immediately following that marker.
+    """
+    Parse both Chase "Points Boost only" results and the normal unfiltered
+    Chase hotel-search results.
+
+    The reliable card boundary in copied Chase text is the hotel heading
+    immediately before "Star rating". A boosted card may also contain a
+    "Points Boost" marker, but that marker is NOT required.
+    """
     lines = [_clean_line(x) for x in text.splitlines() if _clean_line(x)]
     out = []
-    positions = [i for i, x in enumerate(lines) if x.lower() == "points boost"]
 
-    for n, pos in enumerate(positions):
-        end = positions[n + 1] if n + 1 < len(positions) else len(lines)
-        block = lines[pos:end]
-        if pos + 1 >= len(lines):
+    generic = {
+        "primary image", "pool", "points boost", "property amenity",
+        "indoor pool", "exterior", "room", "fitness facility",
+        "terrace/patio", "balcony", "mini-golf", "skiing", "outdoor pool",
+        "floor plan", "swimmingpool", "swimming pool", "svg",
+        "points boost only"
+    }
+
+    # Each Chase property card has a "Star rating" line. The hotel name is
+    # normally the nearest preceding non-generic, non-price line.
+    star_positions = [i for i, x in enumerate(lines) if x.lower() == "star rating"]
+
+    for idx, star_pos in enumerate(star_positions):
+        # Find the property name immediately preceding "Star rating".
+        name = None
+        for j in range(star_pos - 1, max(-1, star_pos - 8), -1):
+            candidate = lines[j].strip().strip("*")
+            if not candidate:
+                continue
+            if candidate.lower() in generic:
+                continue
+            if candidate.startswith(("http://", "https://")):
+                continue
+            if candidate.lower() in {"or", "all-in total", "nightly average"}:
+                continue
+            if re.fullmatch(r"\$[\d,]+(?:\.\d+)?", candidate):
+                continue
+            if re.fullmatch(r"[\d,]+\s*pts?", candidate, re.I):
+                continue
+            if re.search(r"\bstar\b", candidate, re.I):
+                continue
+            # Image alt text can appear immediately before the heading; the
+            # actual hotel name is usually the first plausible text after it.
+            if len(candidate) >= 3:
+                name = candidate
+                break
+
+        if not name:
             continue
 
-        name = lines[pos + 1]
-        if _is_generic_chase_line(name) or name.lower() in {"star rating", "sold out"}:
-            continue
+        end_pos = star_positions[idx + 1] if idx + 1 < len(star_positions) else len(lines)
+        block = lines[star_pos:end_pos]
 
         total = orig = pts = due = star = rating = None
+        sold = any(x.lower() == "sold out" for x in block)
+
+        # Star rating.
+        for x in block[:4]:
+            m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*star", x, re.I)
+            if m:
+                star = float(m.group(1))
+                break
+
+        # Tripadvisor rating, if present.
+        for x in block:
+            m = re.search(r"(?:Tripadvisors? rating|Tripadvisor).*?([0-9]+(?:\.[0-9]+)?)", x, re.I)
+            if m:
+                rating = float(m.group(1))
+                break
+
+        # Cash: always take the number immediately following "All-in total".
         for j, x in enumerate(block):
             if x.lower() == "all-in total" and j + 1 < len(block):
                 total = parse_money(block[j + 1])
+                break
 
-            m = re.search(r'Original points\s*([0-9,]+)', x, re.I)
-            if m:
-                orig = int(m.group(1).replace(",", ""))
-
-            m = re.search(r'new points boost\s*([0-9,]+)', x, re.I)
-            if m:
-                pts = int(m.group(1).replace(",", ""))
-
-            m = re.search(r'\$([0-9,]+(?:\.[0-9]+)?)\s*due at property', x, re.I)
+        # Property fee.
+        for x in block:
+            m = re.search(r"\$([0-9,]+(?:\.[0-9]+)?)\s*due at property", x, re.I)
             if m:
                 due = float(m.group(1).replace(",", ""))
+                break
 
-            m = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)\s*star', x, re.I)
-            if m:
-                star = float(m.group(1))
+        # Locate the "or" that introduces the points price. Chase's copied
+        # text may put the numbers on separate lines or in one labeled line.
+        or_positions = [j for j, x in enumerate(block) if x.lower() == "or"]
+        if or_positions:
+            o = or_positions[-1]
+            after_or = block[o + 1:o + 10]
 
-            m = re.search(r'(?:Tripadvisors? rating|Tripadvisor).*?([0-9]+(?:\.[0-9]+)?)', x, re.I)
-            if m and rating is None:
-                rating = float(m.group(1))
+            # Boosted format:
+            # Original points 209,036, new points boost 149,312 pts
+            for x in after_or:
+                m = re.search(r"Original points\s*([0-9,]+)", x, re.I)
+                if m:
+                    orig = int(m.group(1).replace(",", ""))
+                m = re.search(r"new points boost\s*([0-9,]+)", x, re.I)
+                if m:
+                    pts = int(m.group(1).replace(",", ""))
 
-        # Chase repeats the point counts as standalone lines after "or".
-        if orig is None:
-            for j, x in enumerate(block):
-                if x.lower() == "or" and j + 1 < len(block):
-                    m = re.fullmatch(r'([0-9,]+)', block[j + 1])
+            # Unboosted format: 134,048 pts
+            if orig is None:
+                for x in after_or:
+                    m = re.fullmatch(r"([0-9,]+)\s*pts?", x, re.I)
                     if m:
                         orig = int(m.group(1).replace(",", ""))
+                        pts = orig
                         break
 
-        if pts is None and orig is not None:
-            # Find the first different standalone integer after the original count.
-            for j, x in enumerate(block):
-                if x.replace(",", "") == str(orig):
-                    for y in block[j + 1:j + 5]:
-                        m = re.fullmatch(r'([0-9,]+)', y)
-                        if m:
-                            candidate = int(m.group(1).replace(",", ""))
-                            if candidate != orig:
-                                pts = candidate
-                                break
-                    if pts is not None:
-                        break
+            # Some copied versions repeat the same numbers as standalone
+            # lines, so use the first integer after "or" when necessary.
+            if orig is None:
+                nums = []
+                for x in after_or:
+                    m = re.fullmatch(r"([0-9,]+)", x)
+                    if m:
+                        nums.append(int(m.group(1).replace(",", "")))
+                if nums:
+                    orig = nums[0]
+                    pts = nums[1] if len(nums) > 1 else nums[0]
 
-        sold = any(x.lower() == "sold out" for x in block)
+            # If only original points were labeled, the unboosted value is
+            # simply the original amount.
+            if pts is None and orig is not None:
+                pts = orig
+
+        # A result is useful if it has a cash price or is sold out.
         if total is not None or sold:
+            boosted = bool(orig is not None and pts is not None and pts != orig)
             out.append({
-                "name": name, "source": "Chase Travel", "cash": total,
-                "points": pts, "original_points": orig, "due": due,
-                "rating": rating, "star": star, "sold_out": sold,
-                "boost": bool(pts and orig)
+                "name": name,
+                "source": "Chase Travel",
+                "cash": total,
+                "points": pts,
+                "original_points": orig,
+                "due": due,
+                "rating": rating,
+                "star": star,
+                "sold_out": sold,
+                "boost": boosted
             })
+
     return out
 
 def parse_expedia_bulk(text):
@@ -463,7 +534,7 @@ def source_match_label(row):
 # -------- UI --------
 # -------- UI --------
 st.title("✈️ Travel Optimizer")
-st.caption("Phase 4.1 — master property pool + competitive Chase point valuation")
+st.caption("Phase 4.2 — full Chase import + competitive Chase point valuation")
 
 with st.sidebar:
     st.header("Trip")
@@ -594,6 +665,11 @@ if properties:
             f"({len(properties)} from Nuitee + {counts.get('chase',0)} Chase results + "
             f"{counts.get('expedia',0)} Expedia results, after matching/deduplication)."
         )
+        if counts.get("chase", 0):
+            st.caption(
+                f"Chase importer captured **{counts.get('chase',0)} property cards**. "
+                "You can now paste the normal unfiltered Chase results; Points Boost is optional."
+            )
 
         display=[]
         for p in master:
@@ -636,7 +712,8 @@ if properties:
                 "Best cash source": best_cash_source or "—",
                 "Nuitee low": f"${n_cash:,.0f}" if n_cash is not None else "—",
                 "Chase low": f"${c_cash:,.0f}" if c_cash is not None else ("Sold out" if c and c.get("sold_out") else "—"),
-                "Chase Boost pts": f"{c_pts:,}" if c_pts else "—",
+                "Chase points": f"{c_pts:,}" if c_pts else "—",
+                "Chase boost": "Yes" if c and c.get("boost") else ("No" if c else "—"),
                 "Chase portal value": f"{portal_cpp:.2f}¢/pt" if portal_cpp is not None else "—",
                 "Chase competitive value": f"{competitive_cpp:.2f}¢/pt" if competitive_cpp is not None else "—",
                 "Expedia low": f"${e_cash:,.0f}" if e_cash is not None else "—",
